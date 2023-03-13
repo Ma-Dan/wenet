@@ -37,6 +37,9 @@
 #ifdef USE_OPENVINO
 #include "ov/ov_asr_model.h"
 #endif
+#ifdef USE_NCNN
+#include "decoder/ncnn_asr_model.h"
+#endif
 #include "frontend/feature_pipeline.h"
 #include "post_processor/post_processor.h"
 #include "utils/flags.h"
@@ -57,6 +60,8 @@ DEFINE_string(bpu_model_dir, "",
 // OVAsrModel flags
 DEFINE_string(openvino_dir, "", "directory where the OV model is saved");
 DEFINE_int32(core_number, 1, "Core number of process");
+// NcnnAsrModel flags
+DEFINE_string(ncnn_dir, "", "directory where the ncnn model is saved");
 
 // FeaturePipelineConfig flags
 DEFINE_int32(num_bins, 80, "num mel bins for fbank feature");
@@ -189,6 +194,16 @@ std::shared_ptr<DecodeResource> InitDecodeResourceFromFlags() {
     resource->model = model;
 #else
     LOG(FATAL) << "Please rebuild with cmake options '-DOPENVINO=ON'.";
+#endif
+  } else if (!FLAGS_ncnn_dir.empty()) {
+#ifdef USE_NCNN
+    LOG(INFO) << "Reading ncnn model ";
+    NcnnAsrModel::InitEngineThreads(kNumGemmThreads);
+    auto model = std::make_shared<NcnnAsrModel>();
+    model->Read(FLAGS_ncnn_dir);
+    resource->model = model;
+#else
+    LOG(FATAL) << "Please rebuild with cmake options '-DNCNN=ON'.";
 #endif
   } else {
     LOG(FATAL) << "Please set ONNX, TORCH, XPU, BPU or OpenVINO model path!!!";

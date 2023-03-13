@@ -107,6 +107,77 @@ class PositionalEncoding(torch.nn.Module):
             index = index * flag
             pos_emb = F.embedding(index, self.pe[0])  # B X T X d_model
 
+        #pos_emb = self.pe
+
+        if apply_dropout:
+            pos_emb = self.dropout(pos_emb)
+        return pos_emb
+
+class PositionalEncodingExternal(torch.nn.Module):
+    """Positional encoding.
+
+    :param int d_model: embedding dim
+    :param float dropout_rate: dropout rate
+    :param int max_len: maximum input length
+
+    PE(pos, 2i)   = sin(pos/(10000^(2i/dmodel)))
+    PE(pos, 2i+1) = cos(pos/(10000^(2i/dmodel)))
+    """
+    def __init__(self,
+                 d_model: int,
+                 dropout_rate: float,
+                 max_len: int = 5000,
+                 reverse: bool = False):
+        """Construct an PositionalEncoding object."""
+        super().__init__()
+        self.d_model = d_model
+        self.xscale = math.sqrt(self.d_model)
+        self.dropout = torch.nn.Dropout(p=dropout_rate)
+        self.max_len = max_len
+
+        self.pe = torch.zeros(self.max_len, self.d_model)
+
+    def forward(self,
+                x: torch.Tensor,
+                pe_ext: torch.Tensor) \
+            -> Tuple[torch.Tensor, torch.Tensor]:
+        """Add positional encoding.
+
+        Args:
+            x (torch.Tensor): Input. Its shape is (batch, time, ...)
+            offset (int, torch.tensor): position offset
+
+        Returns:
+            torch.Tensor: Encoded tensor. Its shape is (batch, time, ...)
+            torch.Tensor: for compatibility to RelPositionalEncoding
+        """
+
+        self.pe = pe_ext.to(x.device)
+        pos_emb = self.position_encoding(pe_ext, False)
+        x = x * self.xscale + pos_emb
+        return self.dropout(x), self.dropout(pos_emb)
+
+    def position_encoding(self, pe_ext: torch.Tensor,
+                          apply_dropout: bool = True) -> torch.Tensor:
+        """ For getting encoding in a streaming fashion
+
+        Attention!!!!!
+        we apply dropout only once at the whole utterance level in a none
+        streaming way, but will call this function several times with
+        increasing input size in a streaming scenario, so the dropout will
+        be applied several times.
+
+        Args:
+            offset (int or torch.tensor): start offset
+            size (int): required size of position encoding
+
+        Returns:
+            torch.Tensor: Corresponding encoding
+        """
+        # How to subscript a Union type:
+        #   https://github.com/pytorch/pytorch/issues/69434
+        pos_emb = pe_ext  # B X T X d_model
+
         if apply_dropout:
             pos_emb = self.dropout(pos_emb)
         return pos_emb

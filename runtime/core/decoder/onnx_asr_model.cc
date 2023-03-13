@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <memory>
 #include <utility>
+#include <math.h>
 
 #include "utils/string.h"
 
@@ -215,6 +216,9 @@ void OnnxAsrModel::Reset() {
                                      cnn_module_kernel_ - 1};
   cnn_cache_ort_ = Ort::Value::CreateTensor<float>(
       memory_info, cnn_cache_.data(), cnn_cache_.size(), cnn_cache_shape, 4);
+
+  // Init positional encoding
+  InitPositionalEncoding(5000, 256);
 }
 
 void OnnxAsrModel::ForwardEncoderFunc(
@@ -260,16 +264,37 @@ void OnnxAsrModel::ForwardEncoderFunc(
         memory_info, reinterpret_cast<bool*>(att_mask.data()), att_mask.size(),
         att_mask_shape, 3);
   }
+  // positional encoding
+  const int64_t pe_chunk_shape[] = {1, chunk_size_, 256};
+  std::vector<float> pe_chunk;
+  for(size_t i=0; i<chunk_size_; i++) {
+    for(size_t j=0; j<256; j++) {
+      pe_chunk.emplace_back(pe_full[(offset_int64+i)*256+j]);
+    }
+  }
+  Ort::Value pe_chunk_ort = Ort::Value::CreateTensor<float>(
+      memory_info, pe_chunk.data(), chunk_size_*256, pe_chunk_shape, 3);
+
+  const int64_t pe_att_cache_size = att_cache_ort_.GetTensorTypeAndShapeInfo().GetShape()[2]+chunk_size_;
+  const int64_t pe_att_cache_shape[] = {1, pe_att_cache_size, 256};
+  std::vector<float> pe_att_cache;
+  for(size_t i=0; i<pe_att_cache_size; i++) {
+    for(size_t j=0; j<256; j++) {
+      pe_att_cache.emplace_back(pe_full[i*256+j]);
+    }
+  }
+  Ort::Value pe_att_cache_ort = Ort::Value::CreateTensor<float>(
+      memory_info, pe_att_cache.data(), ((int)att_cache_ort_.GetTensorTypeAndShapeInfo().GetShape()[2]+chunk_size_)*256, pe_att_cache_shape, 3);
 
   // 2. Encoder chunk forward
   std::vector<Ort::Value> inputs;
   for (auto name : encoder_in_names_) {
     if (!strcmp(name, "chunk")) {
       inputs.emplace_back(std::move(feats_ort));
-    } else if (!strcmp(name, "offset")) {
-      inputs.emplace_back(std::move(offset_ort));
-    } else if (!strcmp(name, "required_cache_size")) {
-      inputs.emplace_back(std::move(required_cache_size_ort));
+    } else if (!strcmp(name, "pe_chunk")) {
+      inputs.emplace_back(std::move(pe_chunk_ort));
+    } else if (!strcmp(name, "pe_att_cache")) {
+      inputs.emplace_back(std::move(pe_att_cache_ort));
     } else if (!strcmp(name, "att_cache")) {
       inputs.emplace_back(std::move(att_cache_ort_));
     } else if (!strcmp(name, "cnn_cache")) {
@@ -425,6 +450,33 @@ void OnnxAsrModel::AttentionRescoring(const std::vector<std::vector<int>>& hyps,
     (*rescoring_score)[i] =
         score * (1 - reverse_weight) + r_score * reverse_weight;
   }
+}
+
+void OnnxAsrModel::InitPositionalEncoding(int max_len, int d_model) {
+  LOG(INFO) << "InitPositionalEncoding\n";
+
+  std::vector<float> position;
+  std::vector<float> div_term;
+
+  for(int i=0; i<max_len; i++) {
+    position.emplace_back((float)i);
+  }
+
+  for(int i=0; i<d_model; i+=2) {
+    div_term.emplace_back(exp((float)i*(-log(10000.0)/d_model)));
+  }
+
+  for(int i=0; i<max_len; i++) {
+    for(int j=0; j<div_term.size(); j++) {
+      float pe_value = 0.0;
+      pe_value = sin(position[i] * div_term[j]);
+      pe_full.emplace_back(pe_value);
+      pe_value = cos(position[i] * div_term[j]);
+      pe_full.emplace_back(pe_value);
+    }
+  }
+
+  LOG(INFO) << "InitPositionalEncoding done " << pe_full.size() << "\n";
 }
 
 }  // namespace wenet

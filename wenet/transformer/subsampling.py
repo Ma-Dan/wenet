@@ -27,9 +27,8 @@ class BaseSubsampling(torch.nn.Module):
         self.right_context = 0
         self.subsampling_rate = 1
 
-    def position_encoding(self, offset: Union[int, torch.Tensor],
-                          size: int) -> torch.Tensor:
-        return self.pos_enc.position_encoding(offset, size)
+    def position_encoding(self, pe: torch.Tensor) -> torch.Tensor:
+        return self.pos_enc.position_encoding(pe)
 
 
 class LinearNoSubsampling(BaseSubsampling):
@@ -110,7 +109,7 @@ class Conv2dSubsampling4(BaseSubsampling):
             self,
             x: torch.Tensor,
             x_mask: torch.Tensor,
-            offset: Union[int, torch.Tensor] = 0
+            pe: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Subsample x.
 
@@ -126,11 +125,11 @@ class Conv2dSubsampling4(BaseSubsampling):
             torch.Tensor: positional encoding
 
         """
-        x = x.unsqueeze(1)  # (b, c=1, t, f)
+        x = x.reshape(x.shape[0], 1, x.shape[1], x.shape[2])  # (b, c=1, t, f)
         x = self.conv(x)
         b, c, t, f = x.size()
         x = self.out(x.transpose(1, 2).contiguous().view(b, t, c * f))
-        x, pos_emb = self.pos_enc(x, offset)
+        x, pos_emb = self.pos_enc(x, pe)
         return x, pos_emb, x_mask[:, :, 2::2][:, :, 2::2]
 
 

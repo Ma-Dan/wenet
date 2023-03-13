@@ -19,11 +19,13 @@ from typing import Tuple
 
 import torch
 from typeguard import check_argument_types
+import math
 
 from wenet.transformer.attention import MultiHeadedAttention
 from wenet.transformer.attention import RelPositionMultiHeadedAttention
 from wenet.transformer.convolution import ConvolutionModule
 from wenet.transformer.embedding import PositionalEncoding
+from wenet.transformer.embedding import PositionalEncodingExternal
 from wenet.transformer.embedding import RelPositionalEncoding
 from wenet.transformer.embedding import NoPositionalEncoding
 from wenet.transformer.encoder_layer import TransformerEncoderLayer
@@ -97,7 +99,7 @@ class BaseEncoder(torch.nn.Module):
         if pos_enc_layer_type == "abs_pos":
             pos_enc_class = PositionalEncoding
         elif pos_enc_layer_type == "rel_pos":
-            pos_enc_class = RelPositionalEncoding
+            pos_enc_class = PositionalEncodingExternal
         elif pos_enc_layer_type == "no_pos":
             pos_enc_class = NoPositionalEncoding
         else:
@@ -267,6 +269,89 @@ class BaseEncoder(torch.nn.Module):
 
         return (xs, r_att_cache, r_cnn_cache)
 
+    def forward_chunk_external(
+        self,
+        xs: torch.Tensor,
+        pe_chunk: torch.Tensor,
+        pe_att_cache: torch.Tensor,
+        att_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
+        cnn_cache: torch.Tensor = torch.zeros(0, 0, 0, 0),
+        att_mask: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """ Forward just one chunk
+
+        Args:
+            xs (torch.Tensor): chunk input, with shape (b=1, time, mel-dim),
+                where `time == (chunk_size - 1) * subsample_rate + \
+                        subsample.right_context + 1`
+            offset (int): current offset in encoder output time stamp
+            required_cache_size (int): cache size required for next chunk
+                compuation
+                >=0: actual cache size
+                <0: means all history cache is required
+            att_cache (torch.Tensor): cache tensor for KEY & VALUE in
+                transformer/conformer attention, with shape
+                (elayers, head, cache_t1, d_k * 2), where
+                `head * d_k == hidden-dim` and
+                `cache_t1 == chunk_size * num_decoding_left_chunks`.
+            cnn_cache (torch.Tensor): cache tensor for cnn_module in conformer,
+                (elayers, b=1, hidden-dim, cache_t2), where
+                `cache_t2 == cnn.lorder - 1`
+
+        Returns:
+            torch.Tensor: output of current input xs,
+                with shape (b=1, chunk_size, hidden-dim).
+            torch.Tensor: new attention cache required for next chunk, with
+                dynamic shape (elayers, head, ?, d_k * 2)
+                depending on required_cache_size.
+            torch.Tensor: new conformer cnn cache required for next chunk, with
+                same shape as the original cnn_cache.
+
+        """
+        assert xs.size(0) == 1
+        # tmp_masks is just for interface compatibility
+        tmp_masks = torch.ones(1,
+                               xs.size(1),
+                               device=xs.device,
+                               dtype=torch.bool)
+        tmp_masks = tmp_masks.unsqueeze(1)
+        if self.global_cmvn is not None:
+            xs = self.global_cmvn(xs)
+        # NOTE(xcsong): Before embed, shape(xs) is (b=1, time, mel-dim)
+        xs, pos_emb, _ = self.embed(xs, tmp_masks, pe_chunk)
+        # NOTE(xcsong): After  embed, shape(xs) is (b=1, chunk_size, hidden-dim)
+        elayers, cache_t1 = att_cache.size(0), att_cache.size(2)
+        chunk_size = xs.size(1)
+        attention_key_size = cache_t1 + chunk_size
+        pos_emb = self.embed.position_encoding(pe_att_cache)
+        next_cache_start = 0
+        r_att_cache = []
+        r_cnn_cache = []
+        for i, layer in enumerate(self.encoders):
+            # NOTE(xcsong): Before layer.forward
+            #   shape(att_cache[i:i + 1]) is (1, head, cache_t1, d_k * 2),
+            #   shape(cnn_cache[i])       is (b=1, hidden-dim, cache_t2)
+            xs, _, new_att_cache, new_cnn_cache = layer(
+                xs, att_mask, pos_emb,
+                att_cache=att_cache[i].reshape(1, att_cache[i].shape[0], att_cache[i].shape[1], att_cache[i].shape[2]) if elayers > 0 else att_cache,
+                cnn_cache=cnn_cache[i] if cnn_cache.size(0) > 0 else cnn_cache
+            )
+            # NOTE(xcsong): After layer.forward
+            #   shape(new_att_cache) is (1, head, attention_key_size, d_k * 2),
+            #   shape(new_cnn_cache) is (b=1, hidden-dim, cache_t2)
+            r_att_cache.append(new_att_cache[:, :, next_cache_start:, :])
+            r_cnn_cache.append(new_cnn_cache.unsqueeze(0))
+        if self.normalize_before:
+            xs = self.after_norm(xs)
+
+        # NOTE(xcsong): shape(r_att_cache) is (elayers, head, ?, d_k * 2),
+        #   ? may be larger than cache_t1, it depends on required_cache_size
+        r_att_cache = torch.cat(r_att_cache, dim=0)
+        # NOTE(xcsong): shape(r_cnn_cache) is (e, b=1, hidden-dim, cache_t2)
+        r_cnn_cache = torch.cat(r_cnn_cache, dim=0)
+
+        return (xs, r_att_cache, r_cnn_cache)
+
     def forward_chunk_by_chunk(
         self,
         xs: torch.Tensor,
@@ -313,12 +398,26 @@ class BaseEncoder(torch.nn.Module):
         offset = 0
         required_cache_size = decoding_chunk_size * num_decoding_left_chunks
 
+        pe_full = torch.zeros(5000, 256)
+        position = torch.arange(0, 5000, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, 256, 2, dtype=torch.float32) *
+            -(math.log(10000.0) / 256))
+        pe_full[:, 0::2] = torch.sin(position * div_term)
+        pe_full[:, 1::2] = torch.cos(position * div_term)
+        pe_full = pe_full.unsqueeze(0)
+
         # Feed forward overlap input step by step
         for cur in range(0, num_frames - context + 1, stride):
             end = min(cur + decoding_window, num_frames)
             chunk_xs = xs[:, cur:end, :]
-            (y, att_cache, cnn_cache) = self.forward_chunk(
-                chunk_xs, offset, required_cache_size, att_cache, cnn_cache)
+            s = 16
+            if offset == 496:
+                s = 3
+            pe_chunk = pe_full[:, cur:cur+s]
+            pe_att_cache = pe_full[:, 0:att_cache.shape[2]+s]
+            (y, att_cache, cnn_cache) = self.forward_chunk_external(
+                chunk_xs, pe_chunk, pe_att_cache, att_cache, cnn_cache)
             outputs.append(y)
             offset += y.size(1)
         ys = torch.cat(outputs, 1)

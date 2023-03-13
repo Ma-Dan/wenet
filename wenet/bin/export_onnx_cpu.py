@@ -73,12 +73,16 @@ def print_input_output_info(onnx_model, name, prefix="\t\t"):
 def export_encoder(asr_model, args):
     print("Stage-1: export encoder")
     encoder = asr_model.encoder
-    encoder.forward = encoder.forward_chunk
+    encoder.forward = encoder.forward_chunk_external
     encoder_outpath = os.path.join(args['output_dir'], 'encoder.onnx')
 
     print("\tStage-1.1: prepare inputs for encoder")
     chunk = torch.randn(
         (args['batch'], args['decoding_window'], args['feature_size']))
+    pe_chunk = torch.randn(
+        (args['batch'], 16, 256))
+    pe_att_cache = torch.randn(
+        (args['batch'], 16, 256))
     offset = 0
     # NOTE(xcsong): The uncertainty of `next_cache_start` only appears
     #   in the first few chunks, this is caused by dynamic att_cache shape, i,e
@@ -121,7 +125,7 @@ def export_encoder(asr_model, args):
     cnn_cache = torch.zeros(
         (args['num_blocks'], args['batch'],
          args['output_size'], args['cnn_module_kernel'] - 1))
-    inputs = (chunk, offset, required_cache_size,
+    inputs = (chunk, pe_chunk, pe_att_cache,
               att_cache, cnn_cache, att_mask)
     print("\t\tchunk.size(): {}\n".format(chunk.size()),
           "\t\toffset: {}\n".format(offset),
@@ -133,6 +137,8 @@ def export_encoder(asr_model, args):
     print("\tStage-1.2: torch.onnx.export")
     dynamic_axes = {
         'chunk': {1: 'T'},
+        'pe_chunk': {1: 'T_PE_CHUNK'},
+        'pe_att_cache': {1: 'T_PE_ATT_CACHE'},
         'att_cache': {2: 'T_CACHE'},
         'att_mask': {2: 'T_ADD_T_CACHE'},
         'output': {1: 'T'},
@@ -155,7 +161,7 @@ def export_encoder(asr_model, args):
         encoder, inputs, encoder_outpath, opset_version=13,
         export_params=True, do_constant_folding=True,
         input_names=[
-            'chunk', 'offset', 'required_cache_size',
+            'chunk', 'pe_chunk', 'pe_att_cache',
             'att_cache', 'cnn_cache', 'att_mask'
         ],
         output_names=['output', 'r_att_cache', 'r_cnn_cache'],
@@ -175,6 +181,8 @@ def export_encoder(asr_model, args):
     model_quant = os.path.join(args['output_dir'], 'encoder.quant.onnx')
     quantize_dynamic(model_fp32, model_quant, weight_type=QuantType.QUInt8)
     print('\t\tExport onnx_encoder, done! see {}'.format(encoder_outpath))
+
+    return
 
     print("\tStage-1.3: check onnx_encoder and torch_encoder")
     torch_output = []

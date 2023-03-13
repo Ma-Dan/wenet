@@ -14,6 +14,7 @@ option(HTTP "whether to build with http" OFF)
 option(TORCH "whether to build with Torch" ON)
 option(ONNX "whether to build with ONNX" OFF)
 option(GPU "whether to build with GPU" OFF)
+option(NCNN "whether to build with NCNN" OFF)
 
 set(CMAKE_VERBOSE_MAKEFILE OFF)
 
@@ -39,7 +40,9 @@ endif()
 if(ONNX)
   include(onnx)
 endif()
-
+if(NCNN)
+  include(ncnn)
+endif()
 include(openfst)
 include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}

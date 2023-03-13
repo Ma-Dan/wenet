@@ -862,7 +862,7 @@ class ASRModel(torch.nn.Module):
         else:
             return False
 
-    @torch.jit.export
+    #@torch.jit.export
     def forward_attention_decoder(
         self,
         hyps: torch.Tensor,
